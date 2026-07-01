@@ -29,6 +29,11 @@ struct SensorSnapshot {
     bool scdOk = false;
 };
 
+enum class DashboardPage : uint8_t {
+    Sensor = 0,
+    Debug = 1,
+};
+
 struct UiLabels {
     lv_obj_t* title = nullptr;
     lv_obj_t* boardTitle = nullptr;
@@ -63,6 +68,10 @@ uint32_t g_lastSensorPollMs = 0;
 uint32_t g_lastUiRefreshMs = 0;
 uint32_t g_lastMqttPublishMs = 0;
 
+DashboardPage g_currentPage = DashboardPage::Sensor;
+bool g_lastButtonPressed = false;
+uint32_t g_lastButtonChangeMs = 0;
+
 bool lvglLock(int timeout_ms) {
     const TickType_t timeout_ticks =
         (timeout_ms == -1) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
@@ -71,54 +80,88 @@ bool lvglLock(int timeout_ms) {
 
 void lvglUnlock() { xSemaphoreGive(g_lvglMutex); }
 
+const char* currentPageTitle() {
+    return g_currentPage == DashboardPage::Sensor ? "Sensor" : "Debug";
+}
+
 void updateUi() {
     if (!lvglLock(100)) {
         return;
     }
 
-    static char boardLine[64];
-    static char scdLine[64];
-    static char wifiLine[64];
-    static char mqttLine[64];
-    static char updatedLine[48];
+    static char row1Value[64];
+    static char row2Value[64];
+    static char row3Value[64];
+    static char row4Value[64];
+    static char row5Value[48];
+    static char wifiState[64];
+    static char mqttState[32];
 
-    if (g_snapshot.boardOk) {
-        snprintf(boardLine, sizeof(boardLine), "%.1f C   %.1f %%RH",
-                 g_snapshot.boardTempC, g_snapshot.boardHumidity);
-    } else {
-        snprintf(boardLine, sizeof(boardLine), "Board  unavailable");
-    }
-
-    if (g_snapshot.scdOk) {
-        snprintf(scdLine, sizeof(scdLine), "%uppm  %.1f C  %.1f %%RH",
-                 g_snapshot.scdCo2Ppm, g_snapshot.scdTempC,
-                 g_snapshot.scdHumidity);
-    } else {
-        snprintf(scdLine, sizeof(scdLine), "SCD40  unavailable");
-    }
-
-    snprintf(wifiLine, sizeof(wifiLine), "%s",
+    snprintf(wifiState, sizeof(wifiState), "%s",
              !app_config::kEnableWifi
                  ? "disabled"
                  : (WiFi.status() == WL_CONNECTED
                         ? WiFi.localIP().toString().c_str()
                         : "disconnected"));
-    snprintf(mqttLine, sizeof(mqttLine), "%s",
+    snprintf(mqttState, sizeof(mqttState), "%s",
              !app_config::kEnableMqtt
                  ? "disabled"
                  : (g_mqttClient.connected() ? "connected" : "disconnected"));
-    snprintf(updatedLine, sizeof(updatedLine), "Uptime %lus",
-             millis() / 1000UL);
 
-    lv_label_set_text(g_ui.boardValue, boardLine);
-    lv_label_set_text(g_ui.scdValue, scdLine);
-    lv_label_set_text(g_ui.wifiValue, wifiLine);
-    lv_label_set_text(g_ui.mqttValue, mqttLine);
-    lv_label_set_text(g_ui.updatedValue, updatedLine);
+    if (g_currentPage == DashboardPage::Sensor) {
+        lv_label_set_text(g_ui.title, "CO2 Monitor / Sensor");
+        lv_label_set_text(g_ui.boardTitle, "CO2");
+        lv_label_set_text(g_ui.scdTitle, "Temp");
+        lv_label_set_text(g_ui.wifiTitle, "Humidity");
+        lv_label_set_text(g_ui.mqttTitle, "Status");
+        lv_label_set_text(g_ui.updatedTitle, "Page");
+
+        if (g_snapshot.scdOk) {
+            snprintf(row1Value, sizeof(row1Value), "%u ppm",
+                     g_snapshot.scdCo2Ppm);
+            snprintf(row2Value, sizeof(row2Value), "%.1f C",
+                     g_snapshot.scdTempC);
+            snprintf(row3Value, sizeof(row3Value), "%.1f %%RH",
+                     g_snapshot.scdHumidity);
+            snprintf(row4Value, sizeof(row4Value), "measuring");
+        } else {
+            snprintf(row1Value, sizeof(row1Value), "unavailable");
+            snprintf(row2Value, sizeof(row2Value), "--.- C");
+            snprintf(row3Value, sizeof(row3Value), "--.- %%RH");
+            snprintf(row4Value, sizeof(row4Value), "waiting");
+        }
+        snprintf(row5Value, sizeof(row5Value), "%s", currentPageTitle());
+    } else {
+        lv_label_set_text(g_ui.title, "CO2 Monitor / Debug");
+        lv_label_set_text(g_ui.boardTitle, "Board");
+        lv_label_set_text(g_ui.scdTitle, "WiFi");
+        lv_label_set_text(g_ui.wifiTitle, "MQTT");
+        lv_label_set_text(g_ui.mqttTitle, "SCD40");
+        lv_label_set_text(g_ui.updatedTitle, "Uptime");
+
+        if (g_snapshot.boardOk) {
+            snprintf(row1Value, sizeof(row1Value), "%.1f C   %.1f %%RH",
+                     g_snapshot.boardTempC, g_snapshot.boardHumidity);
+        } else {
+            snprintf(row1Value, sizeof(row1Value), "unavailable");
+        }
+        snprintf(row2Value, sizeof(row2Value), "%s", wifiState);
+        snprintf(row3Value, sizeof(row3Value), "%s", mqttState);
+        snprintf(row4Value, sizeof(row4Value), "%s",
+                 g_snapshot.scdOk ? "online" : "unavailable");
+        snprintf(row5Value, sizeof(row5Value), "%lus", millis() / 1000UL);
+    }
+
+    lv_label_set_text(g_ui.boardValue, row1Value);
+    lv_label_set_text(g_ui.scdValue, row2Value);
+    lv_label_set_text(g_ui.wifiValue, row3Value);
+    lv_label_set_text(g_ui.mqttValue, row4Value);
+    lv_label_set_text(g_ui.updatedValue, row5Value);
     lvglUnlock();
 
-    Serial.printf("[UI] board='%s' scd40='%s' wifi='%s' mqtt='%s'\n",
-                  boardLine, scdLine, wifiLine, mqttLine);
+    Serial.printf("[UI] page=%s row1='%s' row2='%s' row3='%s' row4='%s' row5='%s'\n",
+                  currentPageTitle(), row1Value, row2Value, row3Value,
+                  row4Value, row5Value);
 }
 
 void uiCreate() {
@@ -326,6 +369,32 @@ bool initScd40() {
     return true;
 }
 
+void initDashboardButton() {
+    pinMode(board_config::kBootButtonPin, INPUT_PULLUP);
+    g_lastButtonPressed = digitalRead(board_config::kBootButtonPin) == LOW;
+    g_lastButtonChangeMs = millis();
+    Serial.println("Dashboard button ready on GPIO0");
+}
+
+void handleDashboardButton() {
+    const bool pressed = digitalRead(board_config::kBootButtonPin) == LOW;
+    const uint32_t now = millis();
+
+    if (pressed != g_lastButtonPressed &&
+        now - g_lastButtonChangeMs >= 30) {
+        g_lastButtonChangeMs = now;
+        g_lastButtonPressed = pressed;
+
+        if (pressed) {
+            g_currentPage = (g_currentPage == DashboardPage::Sensor)
+                                ? DashboardPage::Debug
+                                : DashboardPage::Sensor;
+            Serial.printf("[UI] switched to %s page\n", currentPageTitle());
+            updateUi();
+        }
+    }
+}
+
 void connectWifi() {
     if (!app_config::kEnableWifi) {
         return;
@@ -486,6 +555,7 @@ void setup() {
                       board_config::kBoardI2cSclPin);
     g_boardWire.setClock(100000);
 
+    initDashboardButton();
     initDisplay();
     initBoardSensor();
     initScd40();
@@ -494,6 +564,7 @@ void setup() {
 }
 
 void loop() {
+    handleDashboardButton();
     connectWifi();
     connectMqtt();
     if (app_config::kEnableMqtt) {

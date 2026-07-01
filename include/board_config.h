@@ -22,6 +22,7 @@ constexpr gpio_num_t kEpdBusyPin = GPIO_NUM_8;
 constexpr gpio_num_t kEpdPowerPin = GPIO_NUM_6;
 constexpr gpio_num_t kAudioPowerPin = GPIO_NUM_42;
 constexpr gpio_num_t kVbatPowerPin = GPIO_NUM_17;
+constexpr gpio_num_t kBootButtonPin = GPIO_NUM_0;
 
 constexpr gpio_num_t kBoardI2cSdaPin = GPIO_NUM_47;
 constexpr gpio_num_t kBoardI2cSclPin = GPIO_NUM_48;
