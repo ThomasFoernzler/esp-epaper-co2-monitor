@@ -6,6 +6,8 @@
 #include <Adafruit_SHTC3.h>
 #include <esp_timer.h>
 #include <lvgl.h>
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
 
 #include "app_config.h"
 #include "board_config.h"
@@ -25,8 +27,11 @@ struct SensorSnapshot {
     float scdTempC = 0.0f;
     float scdHumidity = 0.0f;
     uint16_t scdCo2Ppm = 0;
+    float batteryVoltage = 0.0f;
+    uint8_t batteryPercent = 0;
     bool boardOk = false;
     bool scdOk = false;
+    bool batteryOk = false;
 };
 
 enum class DashboardPage : uint8_t {
@@ -34,24 +39,46 @@ enum class DashboardPage : uint8_t {
     Debug = 1,
 };
 
-struct UiLabels {
-    lv_obj_t* title = nullptr;
+struct SensorUi {
+    lv_obj_t* co2Label = nullptr;
+    lv_obj_t* co2Value = nullptr;
+    lv_obj_t* co2Unit = nullptr;
+    lv_obj_t* co2Badge = nullptr;
+    lv_obj_t* humidityValue = nullptr;
+    lv_obj_t* humidityLabel = nullptr;
+    lv_obj_t* temperatureLabel = nullptr;
+    lv_obj_t* temperatureValue = nullptr;
+    lv_obj_t* co2ScaleLine = nullptr;
+    lv_obj_t* co2ScaleTick400 = nullptr;
+    lv_obj_t* co2ScaleTick800 = nullptr;
+    lv_obj_t* co2ScaleTick1000 = nullptr;
+    lv_obj_t* co2ScaleTick1400 = nullptr;
+    lv_obj_t* co2ScaleMarker = nullptr;
+    lv_obj_t* co2ScaleMin = nullptr;
+    lv_obj_t* co2Scale800 = nullptr;
+    lv_obj_t* co2Scale1000 = nullptr;
+    lv_obj_t* co2Scale1400 = nullptr;
+    lv_obj_t* co2Status = nullptr;
+};
+
+struct DebugUi {
     lv_obj_t* boardTitle = nullptr;
     lv_obj_t* boardValue = nullptr;
-    lv_obj_t* scdTitle = nullptr;
-    lv_obj_t* scdValue = nullptr;
+    lv_obj_t* batteryTitle = nullptr;
+    lv_obj_t* batteryValue = nullptr;
     lv_obj_t* wifiTitle = nullptr;
     lv_obj_t* wifiValue = nullptr;
     lv_obj_t* mqttTitle = nullptr;
     lv_obj_t* mqttValue = nullptr;
-    lv_obj_t* updatedTitle = nullptr;
-    lv_obj_t* updatedValue = nullptr;
+    lv_obj_t* uptimeTitle = nullptr;
+    lv_obj_t* uptimeValue = nullptr;
 };
 
 epaper_driver_display* g_display = nullptr;
 board_power_bsp_t* g_power = nullptr;
 SemaphoreHandle_t g_lvglMutex = nullptr;
-UiLabels g_ui;
+SensorUi g_sensorUi;
+DebugUi g_debugUi;
 SensorSnapshot g_snapshot;
 WiFiClient g_wifiClient;
 PubSubClient g_mqttClient(g_wifiClient);
@@ -71,6 +98,35 @@ uint32_t g_lastMqttPublishMs = 0;
 DashboardPage g_currentPage = DashboardPage::Sensor;
 bool g_lastButtonPressed = false;
 uint32_t g_lastButtonChangeMs = 0;
+lv_style_t g_labelStyle;
+lv_style_t g_valueStyle;
+lv_style_t g_debugLabelStyle;
+lv_style_t g_debugValueStyle;
+lv_style_t g_scaleTextStyle;
+lv_style_t g_headerValueStyle;
+lv_style_t g_headerUnitStyle;
+esp_adc_cal_characteristics_t g_adcCharacteristics = {};
+bool g_adcOk = false;
+
+constexpr int kCo2ScaleX = 12;
+constexpr int kCo2ScaleY = 74;
+constexpr int kCo2ScaleWidth = 176;
+constexpr int kCo2ScaleHeight = 2;
+constexpr int kCo2ScaleMinPpm = 400;
+constexpr int kCo2ScaleMaxPpm = 1400;
+
+int co2PpmToScaleX(uint16_t ppm) {
+    const int clamped_ppm =
+        constrain(static_cast<int>(ppm), kCo2ScaleMinPpm, kCo2ScaleMaxPpm);
+    return kCo2ScaleX +
+           ((clamped_ppm - kCo2ScaleMinPpm) * kCo2ScaleWidth) /
+               (kCo2ScaleMaxPpm - kCo2ScaleMinPpm);
+}
+
+void setScaleObjGeometry(lv_obj_t* obj, int x, int y, int w, int h) {
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+}
 
 bool lvglLock(int timeout_ms) {
     const TickType_t timeout_ticks =
@@ -80,8 +136,95 @@ bool lvglLock(int timeout_ms) {
 
 void lvglUnlock() { xSemaphoreGive(g_lvglMutex); }
 
-const char* currentPageTitle() {
-    return g_currentPage == DashboardPage::Sensor ? "Sensor" : "Debug";
+void redrawUiNow() {
+    if (!lvglLock(100)) {
+        return;
+    }
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(nullptr);
+    lvglUnlock();
+}
+
+void setHidden(lv_obj_t* obj, bool hidden) {
+    if (hidden) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void applySensorLayout() {
+    setScaleObjGeometry(g_sensorUi.co2ScaleLine, kCo2ScaleX, kCo2ScaleY,
+                        kCo2ScaleWidth, kCo2ScaleHeight);
+    setScaleObjGeometry(g_sensorUi.co2ScaleTick400, co2PpmToScaleX(400),
+                        kCo2ScaleY - 4, 2, 10);
+    setScaleObjGeometry(g_sensorUi.co2ScaleTick800, co2PpmToScaleX(800),
+                        kCo2ScaleY - 4, 2, 10);
+    setScaleObjGeometry(g_sensorUi.co2ScaleTick1000, co2PpmToScaleX(1000),
+                        kCo2ScaleY - 4, 2, 10);
+    setScaleObjGeometry(g_sensorUi.co2ScaleTick1400, co2PpmToScaleX(1400) - 2,
+                        kCo2ScaleY - 4, 2, 10);
+
+    lv_obj_align(g_sensorUi.co2Label, LV_ALIGN_TOP_LEFT, 10, 14);
+    lv_obj_align(g_sensorUi.co2Value, LV_ALIGN_TOP_LEFT, 58, 8);
+    lv_obj_align(g_sensorUi.co2Unit, LV_ALIGN_TOP_RIGHT, -10, 10);
+    lv_obj_align(g_sensorUi.co2Badge, LV_ALIGN_TOP_RIGHT, -10, 30);
+    lv_obj_align(g_sensorUi.co2ScaleMin, LV_ALIGN_TOP_LEFT, 8, 80);
+    lv_obj_align(g_sensorUi.co2Scale800, LV_ALIGN_TOP_LEFT, 71, 80);
+    lv_obj_align(g_sensorUi.co2Scale1000, LV_ALIGN_TOP_LEFT, 102, 80);
+    lv_obj_align(g_sensorUi.co2Scale1400, LV_ALIGN_TOP_LEFT, 156, 80);
+    lv_obj_align(g_sensorUi.humidityValue, LV_ALIGN_TOP_LEFT, 14, 120);
+    lv_obj_align(g_sensorUi.humidityLabel, LV_ALIGN_TOP_LEFT, 14, 158);
+    lv_obj_align(g_sensorUi.temperatureLabel, LV_ALIGN_TOP_LEFT, 116, 120);
+    lv_obj_align(g_sensorUi.temperatureValue, LV_ALIGN_TOP_LEFT, 116, 146);
+}
+
+void applyDebugLayout() {
+    lv_obj_align(g_debugUi.boardTitle, LV_ALIGN_TOP_LEFT, 10, 12);
+    lv_obj_align(g_debugUi.boardValue, LV_ALIGN_TOP_LEFT, 78, 10);
+    lv_obj_align(g_debugUi.batteryTitle, LV_ALIGN_TOP_LEFT, 10, 46);
+    lv_obj_align(g_debugUi.batteryValue, LV_ALIGN_TOP_LEFT, 78, 44);
+    lv_obj_align(g_debugUi.wifiTitle, LV_ALIGN_TOP_LEFT, 10, 82);
+    lv_obj_align(g_debugUi.wifiValue, LV_ALIGN_TOP_LEFT, 78, 80);
+    lv_obj_align(g_debugUi.mqttTitle, LV_ALIGN_TOP_LEFT, 10, 118);
+    lv_obj_align(g_debugUi.mqttValue, LV_ALIGN_TOP_LEFT, 78, 116);
+    lv_obj_align(g_debugUi.uptimeTitle, LV_ALIGN_TOP_LEFT, 10, 154);
+    lv_obj_align(g_debugUi.uptimeValue, LV_ALIGN_TOP_LEFT, 78, 152);
+}
+
+void setSensorPageHidden(bool hidden) {
+    setHidden(g_sensorUi.co2Label, hidden);
+    setHidden(g_sensorUi.co2Value, hidden);
+    setHidden(g_sensorUi.co2Unit, hidden);
+    setHidden(g_sensorUi.co2Badge, hidden);
+    setHidden(g_sensorUi.humidityValue, hidden);
+    setHidden(g_sensorUi.humidityLabel, hidden);
+    setHidden(g_sensorUi.temperatureLabel, hidden);
+    setHidden(g_sensorUi.temperatureValue, hidden);
+    setHidden(g_sensorUi.co2ScaleLine, hidden);
+    setHidden(g_sensorUi.co2ScaleTick400, hidden);
+    setHidden(g_sensorUi.co2ScaleTick800, hidden);
+    setHidden(g_sensorUi.co2ScaleTick1000, hidden);
+    setHidden(g_sensorUi.co2ScaleTick1400, hidden);
+    setHidden(g_sensorUi.co2ScaleMarker, hidden);
+    setHidden(g_sensorUi.co2ScaleMin, hidden);
+    setHidden(g_sensorUi.co2Scale800, hidden);
+    setHidden(g_sensorUi.co2Scale1000, hidden);
+    setHidden(g_sensorUi.co2Scale1400, hidden);
+    setHidden(g_sensorUi.co2Status, true);
+}
+
+void setDebugPageHidden(bool hidden) {
+    setHidden(g_debugUi.boardTitle, hidden);
+    setHidden(g_debugUi.boardValue, hidden);
+    setHidden(g_debugUi.batteryTitle, hidden);
+    setHidden(g_debugUi.batteryValue, hidden);
+    setHidden(g_debugUi.wifiTitle, hidden);
+    setHidden(g_debugUi.wifiValue, hidden);
+    setHidden(g_debugUi.mqttTitle, hidden);
+    setHidden(g_debugUi.mqttValue, hidden);
+    setHidden(g_debugUi.uptimeTitle, hidden);
+    setHidden(g_debugUi.uptimeValue, hidden);
 }
 
 void updateUi() {
@@ -89,13 +232,17 @@ void updateUi() {
         return;
     }
 
-    static char row1Value[64];
-    static char row2Value[64];
-    static char row3Value[64];
-    static char row4Value[64];
-    static char row5Value[48];
+    static char boardValue[64];
+    static char batteryValue[32];
+    static char wifiValue[64];
+    static char mqttValue[32];
+    static char uptimeValue[32];
+    static char temperatureValue[32];
+    static char humidityValue[32];
     static char wifiState[64];
     static char mqttState[32];
+    static char co2Value[16];
+    static char co2Status[8];
 
     snprintf(wifiState, sizeof(wifiState), "%s",
              !app_config::kEnableWifi
@@ -109,118 +256,282 @@ void updateUi() {
                  : (g_mqttClient.connected() ? "connected" : "disconnected"));
 
     if (g_currentPage == DashboardPage::Sensor) {
-        lv_label_set_text(g_ui.title, "CO2 Monitor / Sensor");
-        lv_label_set_text(g_ui.boardTitle, "CO2");
-        lv_label_set_text(g_ui.scdTitle, "Temp");
-        lv_label_set_text(g_ui.wifiTitle, "Humidity");
-        lv_label_set_text(g_ui.mqttTitle, "Status");
-        lv_label_set_text(g_ui.updatedTitle, "Page");
+        applySensorLayout();
+        setSensorPageHidden(false);
+        setDebugPageHidden(true);
 
         if (g_snapshot.scdOk) {
-            snprintf(row1Value, sizeof(row1Value), "%u ppm",
-                     g_snapshot.scdCo2Ppm);
-            snprintf(row2Value, sizeof(row2Value), "%.1f C",
+            snprintf(co2Value, sizeof(co2Value), "%u", g_snapshot.scdCo2Ppm);
+            snprintf(temperatureValue, sizeof(temperatureValue), "%.1f",
                      g_snapshot.scdTempC);
-            snprintf(row3Value, sizeof(row3Value), "%.1f %%RH",
+            snprintf(humidityValue, sizeof(humidityValue), "%.1f",
                      g_snapshot.scdHumidity);
-            snprintf(row4Value, sizeof(row4Value), "measuring");
+            if (g_snapshot.scdCo2Ppm < 800) {
+                snprintf(co2Status, sizeof(co2Status), "OK");
+            } else if (g_snapshot.scdCo2Ppm < 1000) {
+                snprintf(co2Status, sizeof(co2Status), "!");
+            } else {
+                snprintf(co2Status, sizeof(co2Status), "!!");
+            }
+            setScaleObjGeometry(g_sensorUi.co2ScaleMarker,
+                                co2PpmToScaleX(g_snapshot.scdCo2Ppm) - 2,
+                                kCo2ScaleY - 8, 4, 16);
         } else {
-            snprintf(row1Value, sizeof(row1Value), "unavailable");
-            snprintf(row2Value, sizeof(row2Value), "--.- C");
-            snprintf(row3Value, sizeof(row3Value), "--.- %%RH");
-            snprintf(row4Value, sizeof(row4Value), "waiting");
+            snprintf(co2Value, sizeof(co2Value), "--");
+            snprintf(temperatureValue, sizeof(temperatureValue), "--.-");
+            snprintf(humidityValue, sizeof(humidityValue), "--.-");
+            snprintf(co2Status, sizeof(co2Status), "--");
+            setScaleObjGeometry(g_sensorUi.co2ScaleMarker,
+                                co2PpmToScaleX(400) - 2, kCo2ScaleY - 8, 4, 16);
         }
-        snprintf(row5Value, sizeof(row5Value), "%s", currentPageTitle());
+        lv_label_set_text(g_sensorUi.co2Value, co2Value);
+        lv_label_set_text(g_sensorUi.temperatureValue, temperatureValue);
+        lv_label_set_text(g_sensorUi.humidityValue, humidityValue);
+        lv_label_set_text(g_sensorUi.co2Badge, co2Status);
     } else {
-        lv_label_set_text(g_ui.title, "CO2 Monitor / Debug");
-        lv_label_set_text(g_ui.boardTitle, "Board");
-        lv_label_set_text(g_ui.scdTitle, "WiFi");
-        lv_label_set_text(g_ui.wifiTitle, "MQTT");
-        lv_label_set_text(g_ui.mqttTitle, "SCD40");
-        lv_label_set_text(g_ui.updatedTitle, "Uptime");
+        applyDebugLayout();
+        setSensorPageHidden(true);
+        setDebugPageHidden(false);
 
         if (g_snapshot.boardOk) {
-            snprintf(row1Value, sizeof(row1Value), "%.1f C   %.1f %%RH",
+            snprintf(boardValue, sizeof(boardValue), "%.1f C   %.1f %%RH",
                      g_snapshot.boardTempC, g_snapshot.boardHumidity);
         } else {
-            snprintf(row1Value, sizeof(row1Value), "unavailable");
+            snprintf(boardValue, sizeof(boardValue), "unavailable");
         }
-        snprintf(row2Value, sizeof(row2Value), "%s", wifiState);
-        snprintf(row3Value, sizeof(row3Value), "%s", mqttState);
-        snprintf(row4Value, sizeof(row4Value), "%s",
-                 g_snapshot.scdOk ? "online" : "unavailable");
-        snprintf(row5Value, sizeof(row5Value), "%lus", millis() / 1000UL);
-    }
+        if (g_snapshot.batteryOk) {
+            snprintf(batteryValue, sizeof(batteryValue), "%u%%  %.2fV",
+                     g_snapshot.batteryPercent, g_snapshot.batteryVoltage);
+        } else {
+            snprintf(batteryValue, sizeof(batteryValue), "unavailable");
+        }
+        snprintf(wifiValue, sizeof(wifiValue), "%s", wifiState);
+        snprintf(mqttValue, sizeof(mqttValue), "%s", mqttState);
+        snprintf(uptimeValue, sizeof(uptimeValue), "%lus", millis() / 1000UL);
 
-    lv_label_set_text(g_ui.boardValue, row1Value);
-    lv_label_set_text(g_ui.scdValue, row2Value);
-    lv_label_set_text(g_ui.wifiValue, row3Value);
-    lv_label_set_text(g_ui.mqttValue, row4Value);
-    lv_label_set_text(g_ui.updatedValue, row5Value);
+        lv_label_set_text(g_debugUi.boardValue, boardValue);
+        lv_label_set_text(g_debugUi.batteryValue, batteryValue);
+        lv_label_set_text(g_debugUi.wifiValue, wifiValue);
+        lv_label_set_text(g_debugUi.mqttValue, mqttValue);
+        lv_label_set_text(g_debugUi.uptimeValue, uptimeValue);
+    }
     lvglUnlock();
 
-    Serial.printf("[UI] page=%s row1='%s' row2='%s' row3='%s' row4='%s' row5='%s'\n",
-                  currentPageTitle(), row1Value, row2Value, row3Value,
-                  row4Value, row5Value);
+    Serial.printf("[UI] page=%s row1='%s' row2='%s' row3='%s' row4='%s'\n",
+                  g_currentPage == DashboardPage::Sensor ? "Sensor" : "Debug",
+                  g_currentPage == DashboardPage::Sensor ? co2Value : boardValue,
+                  g_currentPage == DashboardPage::Sensor ? temperatureValue
+                                                         : batteryValue,
+                  g_currentPage == DashboardPage::Sensor ? humidityValue
+                                                         : wifiValue,
+                  g_currentPage == DashboardPage::Sensor ? co2Status
+                                                         : mqttValue);
 }
 
 void uiCreate() {
     lv_obj_t* screen = lv_scr_act();
     lv_obj_set_style_bg_color(screen, lv_color_white(), 0);
     lv_obj_set_style_text_color(screen, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(screen, 0, 0);
 
-    g_ui.title = lv_label_create(screen);
-    lv_label_set_text(g_ui.title, "CO2 Monitor");
-    lv_obj_align(g_ui.title, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_style_init(&g_labelStyle);
+    lv_style_set_text_font(&g_labelStyle, &lv_font_montserrat_20);
 
-    g_ui.boardTitle = lv_label_create(screen);
-    lv_label_set_text(g_ui.boardTitle, "Board");
-    lv_obj_align(g_ui.boardTitle, LV_ALIGN_TOP_LEFT, 10, 52);
+    lv_style_init(&g_valueStyle);
+    lv_style_set_text_font(&g_valueStyle, &lv_font_montserrat_28);
 
-    g_ui.boardValue = lv_label_create(screen);
-    lv_obj_set_width(g_ui.boardValue, 110);
-    lv_label_set_long_mode(g_ui.boardValue, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(g_ui.boardValue, "init...");
-    lv_obj_align(g_ui.boardValue, LV_ALIGN_TOP_LEFT, 82, 52);
+    lv_style_init(&g_debugLabelStyle);
+    lv_style_set_text_font(&g_debugLabelStyle, &lv_font_montserrat_16);
 
-    g_ui.scdTitle = lv_label_create(screen);
-    lv_label_set_text(g_ui.scdTitle, "SCD40");
-    lv_obj_align(g_ui.scdTitle, LV_ALIGN_TOP_LEFT, 10, 88);
+    lv_style_init(&g_debugValueStyle);
+    lv_style_set_text_font(&g_debugValueStyle, &lv_font_montserrat_20);
 
-    g_ui.scdValue = lv_label_create(screen);
-    lv_obj_set_width(g_ui.scdValue, 110);
-    lv_label_set_long_mode(g_ui.scdValue, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(g_ui.scdValue, "init...");
-    lv_obj_align(g_ui.scdValue, LV_ALIGN_TOP_LEFT, 82, 88);
+    lv_style_init(&g_scaleTextStyle);
+    lv_style_set_text_font(&g_scaleTextStyle, &lv_font_montserrat_14);
 
-    g_ui.wifiTitle = lv_label_create(screen);
-    lv_label_set_text(g_ui.wifiTitle, "WiFi");
-    lv_obj_align(g_ui.wifiTitle, LV_ALIGN_TOP_LEFT, 10, 132);
+    lv_style_init(&g_headerValueStyle);
+    lv_style_set_text_font(&g_headerValueStyle, &lv_font_montserrat_28);
 
-    g_ui.wifiValue = lv_label_create(screen);
-    lv_obj_set_width(g_ui.wifiValue, 110);
-    lv_label_set_long_mode(g_ui.wifiValue, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(g_ui.wifiValue, "init...");
-    lv_obj_align(g_ui.wifiValue, LV_ALIGN_TOP_LEFT, 82, 132);
+    lv_style_init(&g_headerUnitStyle);
+    lv_style_set_text_font(&g_headerUnitStyle, &lv_font_montserrat_14);
 
-    g_ui.mqttTitle = lv_label_create(screen);
-    lv_label_set_text(g_ui.mqttTitle, "MQTT");
-    lv_obj_align(g_ui.mqttTitle, LV_ALIGN_TOP_LEFT, 10, 156);
+    g_sensorUi.co2Label = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.co2Label, &g_labelStyle, 0);
+    lv_label_set_text(g_sensorUi.co2Label, "CO2");
 
-    g_ui.mqttValue = lv_label_create(screen);
-    lv_obj_set_width(g_ui.mqttValue, 110);
-    lv_label_set_long_mode(g_ui.mqttValue, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(g_ui.mqttValue, "init...");
-    lv_obj_align(g_ui.mqttValue, LV_ALIGN_TOP_LEFT, 82, 156);
+    g_sensorUi.co2Value = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.co2Value, &g_headerValueStyle, 0);
+    lv_label_set_text(g_sensorUi.co2Value, "--");
 
-    g_ui.updatedTitle = lv_label_create(screen);
-    lv_label_set_text(g_ui.updatedTitle, "Uptime");
-    lv_obj_align(g_ui.updatedTitle, LV_ALIGN_TOP_LEFT, 10, 180);
+    g_sensorUi.co2Unit = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.co2Unit, &g_headerUnitStyle, 0);
+    lv_label_set_text(g_sensorUi.co2Unit, "ppm");
 
-    g_ui.updatedValue = lv_label_create(screen);
-    lv_obj_set_width(g_ui.updatedValue, 110);
-    lv_label_set_text(g_ui.updatedValue, "0s");
-    lv_obj_align(g_ui.updatedValue, LV_ALIGN_TOP_LEFT, 82, 180);
+    g_sensorUi.co2Badge = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.co2Badge, &g_labelStyle, 0);
+    lv_label_set_text(g_sensorUi.co2Badge, "OK");
+
+    g_sensorUi.humidityValue = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.humidityValue, &g_valueStyle, 0);
+    lv_obj_set_width(g_sensorUi.humidityValue, 80);
+    lv_label_set_long_mode(g_sensorUi.humidityValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_sensorUi.humidityValue, "--.-");
+
+    g_sensorUi.humidityLabel = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.humidityLabel, &g_labelStyle, 0);
+    lv_obj_set_width(g_sensorUi.humidityLabel, 80);
+    lv_label_set_text(g_sensorUi.humidityLabel, "Rel. Hum.");
+
+    g_sensorUi.temperatureLabel = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.temperatureLabel, &g_labelStyle, 0);
+    lv_obj_set_width(g_sensorUi.temperatureLabel, 80);
+    lv_label_set_text(g_sensorUi.temperatureLabel, "Tmp C");
+
+    g_sensorUi.temperatureValue = lv_label_create(screen);
+    lv_obj_add_style(g_sensorUi.temperatureValue, &g_valueStyle, 0);
+    lv_obj_set_width(g_sensorUi.temperatureValue, 80);
+    lv_label_set_long_mode(g_sensorUi.temperatureValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_sensorUi.temperatureValue, "--.-");
+
+    g_debugUi.boardTitle = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.boardTitle, &g_debugLabelStyle, 0);
+    lv_label_set_text(g_debugUi.boardTitle, "Board");
+
+    g_debugUi.boardValue = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.boardValue, &g_debugValueStyle, 0);
+    lv_obj_set_width(g_debugUi.boardValue, 110);
+    lv_label_set_long_mode(g_debugUi.boardValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_debugUi.boardValue, "init...");
+
+    g_debugUi.batteryTitle = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.batteryTitle, &g_debugLabelStyle, 0);
+    lv_label_set_text(g_debugUi.batteryTitle, "Battery");
+
+    g_debugUi.batteryValue = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.batteryValue, &g_debugValueStyle, 0);
+    lv_obj_set_width(g_debugUi.batteryValue, 110);
+    lv_label_set_long_mode(g_debugUi.batteryValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_debugUi.batteryValue, "init...");
+
+    g_debugUi.wifiTitle = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.wifiTitle, &g_debugLabelStyle, 0);
+    lv_label_set_text(g_debugUi.wifiTitle, "WiFi");
+
+    g_debugUi.wifiValue = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.wifiValue, &g_debugValueStyle, 0);
+    lv_obj_set_width(g_debugUi.wifiValue, 110);
+    lv_label_set_long_mode(g_debugUi.wifiValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_debugUi.wifiValue, "init...");
+
+    g_debugUi.mqttTitle = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.mqttTitle, &g_debugLabelStyle, 0);
+    lv_label_set_text(g_debugUi.mqttTitle, "MQTT");
+
+    g_debugUi.mqttValue = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.mqttValue, &g_debugValueStyle, 0);
+    lv_obj_set_width(g_debugUi.mqttValue, 110);
+    lv_label_set_long_mode(g_debugUi.mqttValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_debugUi.mqttValue, "init...");
+
+    g_debugUi.uptimeTitle = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.uptimeTitle, &g_debugLabelStyle, 0);
+    lv_label_set_text(g_debugUi.uptimeTitle, "Uptime");
+
+    g_debugUi.uptimeValue = lv_label_create(screen);
+    lv_obj_add_style(g_debugUi.uptimeValue, &g_debugValueStyle, 0);
+    lv_obj_set_width(g_debugUi.uptimeValue, 110);
+    lv_label_set_long_mode(g_debugUi.uptimeValue, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_debugUi.uptimeValue, "0s");
+
+    auto makeScaleObj = [&](int w, int h) {
+        lv_obj_t* obj = lv_obj_create(screen);
+        lv_obj_remove_style_all(obj);
+        lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(obj, 0, 0);
+        lv_obj_set_style_radius(obj, 0, 0);
+        lv_obj_set_size(obj, w, h);
+        return obj;
+    };
+
+    g_sensorUi.co2ScaleLine = makeScaleObj(kCo2ScaleWidth, kCo2ScaleHeight);
+    g_sensorUi.co2ScaleTick400 = makeScaleObj(2, 10);
+    g_sensorUi.co2ScaleTick800 = makeScaleObj(2, 10);
+    g_sensorUi.co2ScaleTick1000 = makeScaleObj(2, 10);
+    g_sensorUi.co2ScaleTick1400 = makeScaleObj(2, 10);
+    g_sensorUi.co2ScaleMarker = makeScaleObj(4, 16);
+
+    g_sensorUi.co2ScaleMin = lv_label_create(screen);
+    g_sensorUi.co2Scale800 = lv_label_create(screen);
+    g_sensorUi.co2Scale1000 = lv_label_create(screen);
+    g_sensorUi.co2Scale1400 = lv_label_create(screen);
+    g_sensorUi.co2Status = lv_label_create(screen);
+
+    lv_obj_add_style(g_sensorUi.co2ScaleMin, &g_scaleTextStyle, 0);
+    lv_obj_add_style(g_sensorUi.co2Scale800, &g_scaleTextStyle, 0);
+    lv_obj_add_style(g_sensorUi.co2Scale1000, &g_scaleTextStyle, 0);
+    lv_obj_add_style(g_sensorUi.co2Scale1400, &g_scaleTextStyle, 0);
+    lv_obj_add_style(g_sensorUi.co2Status, &g_scaleTextStyle, 0);
+
+    lv_label_set_text(g_sensorUi.co2ScaleMin, "400");
+    lv_label_set_text(g_sensorUi.co2Scale800, "800");
+    lv_label_set_text(g_sensorUi.co2Scale1000, "1000");
+    lv_label_set_text(g_sensorUi.co2Scale1400, "1400");
+    lv_label_set_text(g_sensorUi.co2Status, "OK");
+    lv_obj_add_flag(g_sensorUi.co2Status, LV_OBJ_FLAG_HIDDEN);
+
+    applySensorLayout();
+    applyDebugLayout();
+    setSensorPageHidden(false);
+    setDebugPageHidden(true);
+}
+
+bool initBatteryAdc() {
+    g_power->powerVbatOn();
+    if (adc1_config_width(ADC_WIDTH_BIT_12) != ESP_OK) {
+        Serial.println("Battery ADC width config failed");
+        return false;
+    }
+    if (adc1_config_channel_atten(ADC1_CHANNEL_3, ADC_ATTEN_DB_12) != ESP_OK) {
+        Serial.println("Battery ADC channel config failed");
+        return false;
+    }
+
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12,
+                             1100, &g_adcCharacteristics);
+    g_adcOk = true;
+
+    Serial.println("Battery ADC ready on ADC1_CH3");
+    return true;
+}
+
+void pollBattery() {
+    if (!g_adcOk) {
+        g_snapshot.batteryOk = false;
+        return;
+    }
+
+    const int raw = adc1_get_raw(ADC1_CHANNEL_3);
+    const uint32_t millivolts =
+        esp_adc_cal_raw_to_voltage(raw, &g_adcCharacteristics);
+
+    g_snapshot.batteryVoltage =
+        0.001f * static_cast<float>(millivolts) * 2.0f;
+    constexpr float kVoltEmpty = 3.0f;
+    constexpr float kVoltFull = 4.12f;
+    if (g_snapshot.batteryVoltage <= kVoltEmpty) {
+        g_snapshot.batteryPercent = 0;
+    } else if (g_snapshot.batteryVoltage >= kVoltFull) {
+        g_snapshot.batteryPercent = 100;
+    } else {
+        g_snapshot.batteryPercent = static_cast<uint8_t>(
+            ((g_snapshot.batteryVoltage - kVoltEmpty) /
+             (kVoltFull - kVoltEmpty)) *
+            100.0f);
+    }
+    g_snapshot.batteryOk = true;
+    Serial.printf("[BAT] %.2fV %u%%\n", g_snapshot.batteryVoltage,
+                  g_snapshot.batteryPercent);
 }
 
 void lvglFlushCb(lv_disp_drv_t* disp_drv, const lv_area_t* area,
@@ -232,7 +543,9 @@ void lvglFlushCb(lv_disp_drv_t* disp_drv, const lv_area_t* area,
         for (int x = area->x1; x <= area->x2; ++x) {
             const uint8_t color =
                 (*buffer < 0x7fff) ? DRIVER_COLOR_BLACK : DRIVER_COLOR_WHITE;
-            g_display->EPD_DrawColorPixel(x, y, color);
+            const uint16_t rotated_x = board_config::kDisplayWidth - 1 - y;
+            const uint16_t rotated_y = x;
+            g_display->EPD_DrawColorPixel(rotated_x, rotated_y, color);
             ++buffer;
         }
     }
@@ -389,8 +702,11 @@ void handleDashboardButton() {
             g_currentPage = (g_currentPage == DashboardPage::Sensor)
                                 ? DashboardPage::Debug
                                 : DashboardPage::Sensor;
-            Serial.printf("[UI] switched to %s page\n", currentPageTitle());
+            Serial.printf("[UI] switched to %s page\n",
+                          g_currentPage == DashboardPage::Sensor ? "Sensor"
+                                                                 : "Debug");
             updateUi();
+            redrawUiNow();
         }
     }
 }
@@ -495,6 +811,8 @@ void publishState() {
 }
 
 void pollSensors() {
+    pollBattery();
+
     sensors_event_t humidity;
     sensors_event_t temperature;
 
@@ -557,6 +875,7 @@ void setup() {
 
     initDashboardButton();
     initDisplay();
+    initBatteryAdc();
     initBoardSensor();
     initScd40();
     pollSensors();
